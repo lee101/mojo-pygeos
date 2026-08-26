@@ -13,113 +13,215 @@ def distance(x0: Float64, y0: Float64, x1: Float64, y1: Float64) -> Float64:
     return sqrt(dx * dx + dy * dy)
 
 
-@export("mpg_metrics")
-def mpg_metrics(
-    coords_addr: Int,
-    coord_offsets_addr: Int,
+def area_one(
+    xs: Ptr,
+    ys: Ptr,
+    ring_offsets_addr: Int,
+    geometry_ring_offsets_addr: Int,
+    kinds_addr: Int,
+    g: Int,
+    areas: Ptr,
+):
+    var ring_offsets = IPtr(unsafe_from_address=ring_offsets_addr)
+    var geometry_ring_offsets = IPtr(unsafe_from_address=geometry_ring_offsets_addr)
+    var kinds = IPtr(unsafe_from_address=kinds_addr)
+    if kinds[g] != 3:
+        areas[g] = 0.0
+        return
+    comptime W = simd_width_of[DType.float64]()
+    var first_ring = Int(geometry_ring_offsets[g])
+    var last_ring = Int(geometry_ring_offsets[g + 1])
+    var total_area = 0.0
+    for r in range(first_ring, last_ring):
+        var i = Int(ring_offsets[r])
+        var end = Int(ring_offsets[r + 1]) - 1
+        var sums = SIMD[DType.float64, W](0.0)
+        while i + W <= end:
+            var x0 = xs.load[width=W](i)
+            var y0 = ys.load[width=W](i)
+            var x1 = xs.load[width=W](i + 1)
+            var y1 = ys.load[width=W](i + 1)
+            sums += x0 * y1 - x1 * y0
+            i += W
+        var area2 = sums.reduce_add()
+        while i < end:
+            area2 += xs[i] * ys[i + 1] - xs[i + 1] * ys[i]
+            i += 1
+        var sign = 1.0 if r == first_ring else -1.0
+        total_area += sign * abs(area2) * 0.5
+    areas[g] = total_area
+
+
+@export("mpg_area")
+def mpg_area(
+    xs_addr: Int,
+    ys_addr: Int,
     ring_offsets_addr: Int,
     geometry_ring_offsets_addr: Int,
     kinds_addr: Int,
     n: Int,
     area_addr: Int,
-    length_addr: Int,
-    bounds_addr: Int,
-    centroid_addr: Int,
 ) abi("C"):
-    var coords = Ptr(unsafe_from_address=coords_addr)
+    var xs = Ptr(unsafe_from_address=xs_addr)
+    var ys = Ptr(unsafe_from_address=ys_addr)
+    var areas = Ptr(unsafe_from_address=area_addr)
+    for g in range(n):
+        area_one(xs, ys, ring_offsets_addr, geometry_ring_offsets_addr, kinds_addr, g, areas)
+
+
+def length_one(xs: Ptr, ys: Ptr, ring_offsets: IPtr, geometry_ring_offsets: IPtr, kinds: IPtr, g: Int, lengths: Ptr):
+    if kinds[g] == 0:
+        lengths[g] = 0.0
+        return
+    comptime W = simd_width_of[DType.float64]()
+    var total = 0.0
+    for r in range(Int(geometry_ring_offsets[g]), Int(geometry_ring_offsets[g + 1])):
+        var i = Int(ring_offsets[r])
+        var end = Int(ring_offsets[r + 1]) - 1
+        var sums = SIMD[DType.float64, W](0.0)
+        while i + W <= end:
+            var dx = xs.load[width=W](i + 1) - xs.load[width=W](i)
+            var dy = ys.load[width=W](i + 1) - ys.load[width=W](i)
+            sums += sqrt(dx * dx + dy * dy)
+            i += W
+        total += sums.reduce_add()
+        while i < end:
+            total += distance(xs[i], ys[i], xs[i + 1], ys[i + 1])
+            i += 1
+    lengths[g] = total
+
+
+@export("mpg_length")
+def mpg_length(xs_addr: Int, ys_addr: Int, ring_offsets_addr: Int, geometry_ring_offsets_addr: Int, kinds_addr: Int, n: Int, length_addr: Int) abi("C"):
+    var xs = Ptr(unsafe_from_address=xs_addr)
+    var ys = Ptr(unsafe_from_address=ys_addr)
+    var ring_offsets = IPtr(unsafe_from_address=ring_offsets_addr)
+    var geometry_ring_offsets = IPtr(unsafe_from_address=geometry_ring_offsets_addr)
+    var kinds = IPtr(unsafe_from_address=kinds_addr)
+    var lengths = Ptr(unsafe_from_address=length_addr)
+    for g in range(n):
+        length_one(xs, ys, ring_offsets, geometry_ring_offsets, kinds, g, lengths)
+
+
+def bounds_one(xs: Ptr, ys: Ptr, coord_offsets: IPtr, g: Int, bounds_ptr: Ptr):
+    var begin = Int(coord_offsets[g])
+    var end = Int(coord_offsets[g + 1])
+    var lo_x = xs[begin]
+    var hi_x = lo_x
+    var lo_y = ys[begin]
+    var hi_y = lo_y
+    for i in range(begin + 1, end):
+        lo_x = min(lo_x, xs[i])
+        hi_x = max(hi_x, xs[i])
+        lo_y = min(lo_y, ys[i])
+        hi_y = max(hi_y, ys[i])
+    bounds_ptr[4 * g] = lo_x
+    bounds_ptr[4 * g + 1] = lo_y
+    bounds_ptr[4 * g + 2] = hi_x
+    bounds_ptr[4 * g + 3] = hi_y
+
+
+@export("mpg_bounds")
+def mpg_bounds(xs_addr: Int, ys_addr: Int, coord_offsets_addr: Int, n: Int, bounds_addr: Int) abi("C"):
+    var xs = Ptr(unsafe_from_address=xs_addr)
+    var ys = Ptr(unsafe_from_address=ys_addr)
+    var coord_offsets = IPtr(unsafe_from_address=coord_offsets_addr)
+    var bounds_ptr = Ptr(unsafe_from_address=bounds_addr)
+    for g in range(n):
+        bounds_one(xs, ys, coord_offsets, g, bounds_ptr)
+
+
+def centroid_one(xs: Ptr, ys: Ptr, coord_offsets: IPtr, ring_offsets: IPtr, geometry_ring_offsets: IPtr, kinds: IPtr, g: Int, centroids: Ptr):
+    comptime W = simd_width_of[DType.float64]()
+    var begin = Int(coord_offsets[g])
+    var kind = Int(kinds[g])
+    var center_x = xs[begin]
+    var center_y = ys[begin]
+    if kind == 1:
+        var i = begin
+        var end = Int(coord_offsets[g + 1]) - 1
+        var length_v = SIMD[DType.float64, W](0.0)
+        var x_v = SIMD[DType.float64, W](0.0)
+        var y_v = SIMD[DType.float64, W](0.0)
+        while i + W <= end:
+            var x0 = xs.load[width=W](i)
+            var y0 = ys.load[width=W](i)
+            var x1 = xs.load[width=W](i + 1)
+            var y1 = ys.load[width=W](i + 1)
+            var d = sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0))
+            length_v += d
+            x_v += (x0 + x1) * 0.5 * d
+            y_v += (y0 + y1) * 0.5 * d
+            i += W
+        var total_length = length_v.reduce_add()
+        var weighted_x = x_v.reduce_add()
+        var weighted_y = y_v.reduce_add()
+        while i < end:
+            var d = distance(xs[i], ys[i], xs[i + 1], ys[i + 1])
+            total_length += d
+            weighted_x += (xs[i] + xs[i + 1]) * 0.5 * d
+            weighted_y += (ys[i] + ys[i + 1]) * 0.5 * d
+            i += 1
+        if total_length != 0.0:
+            center_x = weighted_x / total_length
+            center_y = weighted_y / total_length
+    elif kind == 3:
+        var first_ring = Int(geometry_ring_offsets[g])
+        var total_area = 0.0
+        center_x = 0.0
+        center_y = 0.0
+        for r in range(first_ring, Int(geometry_ring_offsets[g + 1])):
+            var i = Int(ring_offsets[r])
+            var end = Int(ring_offsets[r + 1]) - 1
+            var area_v = SIMD[DType.float64, W](0.0)
+            var x_v = SIMD[DType.float64, W](0.0)
+            var y_v = SIMD[DType.float64, W](0.0)
+            while i + W <= end:
+                var x0 = xs.load[width=W](i)
+                var y0 = ys.load[width=W](i)
+                var x1 = xs.load[width=W](i + 1)
+                var y1 = ys.load[width=W](i + 1)
+                var cross = x0 * y1 - x1 * y0
+                area_v += cross
+                x_v += (x0 + x1) * cross
+                y_v += (y0 + y1) * cross
+                i += W
+            var area2 = area_v.reduce_add()
+            var xsum = x_v.reduce_add()
+            var ysum = y_v.reduce_add()
+            while i < end:
+                var cross = xs[i] * ys[i + 1] - xs[i + 1] * ys[i]
+                area2 += cross
+                xsum += (xs[i] + xs[i + 1]) * cross
+                ysum += (ys[i] + ys[i + 1]) * cross
+                i += 1
+            var ring_area = abs(area2) * 0.5
+            var sign = 1.0 if r == first_ring else -1.0
+            total_area += sign * ring_area
+            if area2 != 0.0:
+                center_x += sign * ring_area * xsum / (3.0 * area2)
+                center_y += sign * ring_area * ysum / (3.0 * area2)
+        if total_area != 0.0:
+            center_x /= total_area
+            center_y /= total_area
+        else:
+            center_x = xs[begin]
+            center_y = ys[begin]
+    centroids[2 * g] = center_x
+    centroids[2 * g + 1] = center_y
+
+
+@export("mpg_centroid")
+def mpg_centroid(xs_addr: Int, ys_addr: Int, coord_offsets_addr: Int, ring_offsets_addr: Int, geometry_ring_offsets_addr: Int, kinds_addr: Int, n: Int, centroid_addr: Int) abi("C"):
+    var xs = Ptr(unsafe_from_address=xs_addr)
+    var ys = Ptr(unsafe_from_address=ys_addr)
     var coord_offsets = IPtr(unsafe_from_address=coord_offsets_addr)
     var ring_offsets = IPtr(unsafe_from_address=ring_offsets_addr)
     var geometry_ring_offsets = IPtr(unsafe_from_address=geometry_ring_offsets_addr)
     var kinds = IPtr(unsafe_from_address=kinds_addr)
-    var areas = Ptr(unsafe_from_address=area_addr)
-    var lengths = Ptr(unsafe_from_address=length_addr)
-    var bounds_ptr = Ptr(unsafe_from_address=bounds_addr)
     var centroids = Ptr(unsafe_from_address=centroid_addr)
     for g in range(n):
-        var begin = Int(coord_offsets[g])
-        var end = Int(coord_offsets[g + 1])
-        var lo_x = coords[2 * begin]
-        var hi_x = lo_x
-        var lo_y = coords[2 * begin + 1]
-        var hi_y = lo_y
-        for i in range(begin + 1, end):
-            var x = coords[2 * i]
-            var y = coords[2 * i + 1]
-            if x < lo_x:
-                lo_x = x
-            if x > hi_x:
-                hi_x = x
-            if y < lo_y:
-                lo_y = y
-            if y > hi_y:
-                hi_y = y
-        bounds_ptr[4 * g] = lo_x
-        bounds_ptr[4 * g + 1] = lo_y
-        bounds_ptr[4 * g + 2] = hi_x
-        bounds_ptr[4 * g + 3] = hi_y
-        var kind = Int(kinds[g])
-        var total_length = 0.0
-        var total_area = 0.0
-        var center_x = 0.0
-        var center_y = 0.0
-        if kind == 0:
-            center_x = coords[2 * begin]
-            center_y = coords[2 * begin + 1]
-        elif kind == 1:
-            var weighted_x = 0.0
-            var weighted_y = 0.0
-            for i in range(begin, end - 1):
-                var x0 = coords[2 * i]
-                var y0 = coords[2 * i + 1]
-                var x1 = coords[2 * (i + 1)]
-                var y1 = coords[2 * (i + 1) + 1]
-                var d = distance(x0, y0, x1, y1)
-                total_length += d
-                weighted_x += (x0 + x1) * 0.5 * d
-                weighted_y += (y0 + y1) * 0.5 * d
-            if total_length != 0.0:
-                center_x = weighted_x / total_length
-                center_y = weighted_y / total_length
-            else:
-                center_x = coords[2 * begin]
-                center_y = coords[2 * begin + 1]
-        else:
-            var first_ring = Int(geometry_ring_offsets[g])
-            var last_ring = Int(geometry_ring_offsets[g + 1])
-            for r in range(first_ring, last_ring):
-                var rb = Int(ring_offsets[r])
-                var re = Int(ring_offsets[r + 1])
-                var ring_area2 = 0.0
-                var ring_xsum = 0.0
-                var ring_ysum = 0.0
-                var ring_length = 0.0
-                for i in range(rb, re - 1):
-                    var x0 = coords[2 * i]
-                    var y0 = coords[2 * i + 1]
-                    var x1 = coords[2 * (i + 1)]
-                    var y1 = coords[2 * (i + 1) + 1]
-                    var cross = x0 * y1 - x1 * y0
-                    ring_area2 += cross
-                    ring_xsum += (x0 + x1) * cross
-                    ring_ysum += (y0 + y1) * cross
-                    ring_length += distance(x0, y0, x1, y1)
-                total_length += ring_length
-                var ring_area = abs(ring_area2) * 0.5
-                var sign = 1.0 if r == first_ring else -1.0
-                total_area += sign * ring_area
-                if ring_area2 != 0.0:
-                    center_x += sign * ring_area * ring_xsum / (3.0 * ring_area2)
-                    center_y += sign * ring_area * ring_ysum / (3.0 * ring_area2)
-            if total_area != 0.0:
-                center_x /= total_area
-                center_y /= total_area
-            else:
-                center_x = coords[2 * begin]
-                center_y = coords[2 * begin + 1]
-        areas[g] = total_area
-        lengths[g] = total_length
-        centroids[2 * g] = center_x
-        centroids[2 * g + 1] = center_y
+        centroid_one(xs, ys, coord_offsets, ring_offsets, geometry_ring_offsets, kinds, g, centroids)
 
 
 def on_segment(x0: Float64, y0: Float64, x1: Float64, y1: Float64, x: Float64, y: Float64) -> Bool:

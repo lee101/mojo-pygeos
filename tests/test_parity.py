@@ -5,7 +5,7 @@ import pytest
 
 import mojo_pygeos as mpg
 import pygeos
-from mojo_pygeos.geometry import _PACK_CACHE
+from mojo_pygeos.geometry import _PACK_CACHE, _PARALLEL_THRESHOLD
 
 
 def both(kind, coords):
@@ -75,6 +75,37 @@ def test_simd_point_distance_handles_scalar_tail():
     query = mpg.points([1, -1])
     ref_query = pygeos.points([1, -1])
     assert np.allclose(mpg.distance(ours, query), pygeos.distance(reference, ref_query))
+
+
+def test_simd_metric_reductions_handle_scalar_tails():
+    angles = np.linspace(0, 2 * np.pi, 11)[:-1]
+    ring = np.column_stack((np.cos(angles), np.sin(angles)))
+    ours = mpg.polygons(ring)
+    reference = pygeos.polygons(ring)
+    assert mpg.area(ours) == pytest.approx(pygeos.area(reference))
+    assert mpg.length(ours) == pytest.approx(pygeos.length(reference))
+    assert np.allclose(mpg.get_coordinates(mpg.centroid(ours)),
+                       pygeos.get_coordinates(pygeos.centroid(reference)))
+
+
+@pytest.mark.parametrize("size", [_PARALLEL_THRESHOLD - 1, _PARALLEL_THRESHOLD])
+def test_metrics_match_across_parallel_threshold(size):
+    polygon = mpg.polygons([[0, 0], [3, 0], [3, 2], [0, 2]])
+    geometries = np.empty(size, dtype=object)
+    geometries[:] = polygon
+    assert np.allclose(mpg.area(geometries), 6.0)
+    assert np.allclose(mpg.length(geometries), 10.0)
+    assert np.allclose(mpg.bounds(geometries), [0.0, 0.0, 3.0, 2.0])
+    assert np.allclose(mpg.get_coordinates(mpg.centroid(geometries)),
+                       np.tile([1.5, 1.0], (size, 1)))
+
+
+def test_centroid_cache_returns_independent_object_arrays():
+    geometries = np.array([mpg.box(0, 0, 2, 2), mpg.box(2, 2, 4, 4)], dtype=object)
+    first = mpg.centroid(geometries)
+    expected = mpg.get_coordinates(first).copy()
+    first[0] = mpg.points([99, 99])
+    assert np.allclose(mpg.get_coordinates(mpg.centroid(geometries)), expected)
 
 
 def test_metrics_reuse_packed_array_buffers():

@@ -12,7 +12,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 LIB = os.environ.get("MOJO_PYGEOS_LIB") or os.path.join(ROOT, "dist", "libmojo-pygeos.so")
 I, F = ctypes.c_int64, ctypes.c_double
 SIGNATURES = {
-    "mpg_metrics": ([I] * 6 + [I] * 4, None),
+    "mpg_area": ([I] * 7, None),
+    "mpg_length": ([I] * 7, None),
+    "mpg_bounds": ([I] * 5, None),
+    "mpg_centroid": ([I] * 8, None),
     "mpg_point_relation": ([I] * 8, None),
     "mpg_point_distance_scalar": ([I, I, I, F, F, I], None),
 }

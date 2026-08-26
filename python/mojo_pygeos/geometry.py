@@ -7,6 +7,8 @@ object arrays so NumPy broadcasting has the same useful shape rules as pygeos.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+import os
 import re
 from typing import Iterable
 import weakref
@@ -19,6 +21,10 @@ POINT, LINESTRING, LINEARRING, POLYGON = 0, 1, 2, 3
 
 
 _PACK_CACHE: dict[int, tuple[weakref.ReferenceType, tuple[np.ndarray, ...]]] = {}
+_CENTROID_CACHE: dict[int, tuple[weakref.ReferenceType, np.ndarray]] = {}
+_PARALLEL_THRESHOLD = 8192
+_WORKERS = min(8, os.cpu_count() or 1)
+_EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS)
 
 
 class _GeometryArray(np.ndarray):
@@ -28,7 +34,7 @@ class _GeometryArray(np.ndarray):
         self._point_y = getattr(source, "_point_y", None)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Geometry:
     """One two-dimensional point, line string, linear ring, or polygon."""
 
@@ -209,7 +215,9 @@ def _pack(flat: Iterable[Geometry]):
         for end in ends:
             ring_offsets.append(base + end)
         geom_rings.append(len(ring_offsets) - 1)
-    return (np.ascontiguousarray(np.vstack(coords), dtype=np.float64), i64(coord_offsets),
+    packed_coords = np.ascontiguousarray(np.vstack(coords), dtype=np.float64)
+    return (packed_coords, np.ascontiguousarray(packed_coords[:, 0]),
+            np.ascontiguousarray(packed_coords[:, 1]), i64(coord_offsets),
             i64(ring_offsets), i64(geom_rings), i64(kinds))
 
 
@@ -229,15 +237,24 @@ def _cached_pack(value, flat):
     return packed
 
 
-def _metrics(value):
+def _kernel_input(value):
+    if not isinstance(value, Geometry):
+        cached = _PACK_CACHE.get(id(value))
+        if cached is not None and cached[0]() is value:
+            return value.shape, value.size, cached[1]
     flat, shape = _geometries(value)
-    packed = _cached_pack(value, flat)
-    n = len(flat)
-    areas, lengths = np.empty(n), np.empty(n)
-    b = np.empty((n, 4))
-    c = np.empty((n, 2))
-    lib().mpg_metrics(*(addr(x) for x in packed), n, addr(areas), addr(lengths), addr(b), addr(c))
-    return shape, areas, lengths, b, c
+    return shape, len(flat), _cached_pack(value, flat)
+
+
+def _dispatch(n, call):
+    if n < _PARALLEL_THRESHOLD or _WORKERS == 1:
+        call(0, n)
+        return
+    step = (n + _WORKERS - 1) // _WORKERS
+    futures = [_EXECUTOR.submit(call, start, min(start + step, n))
+               for start in range(0, n, step)]
+    for future in futures:
+        future.result()
 
 
 def _reshape(values, shape):
@@ -245,24 +262,62 @@ def _reshape(values, shape):
 
 
 def area(geometry, **kwargs):
-    shape, values, _, _, _ = _metrics(geometry)
+    shape, n, packed = _kernel_input(geometry)
+    values = np.empty(n)
+    def call(start, end):
+        lib().mpg_area(addr(packed[1]), addr(packed[2]), addr(packed[4]),
+                       addr(packed[5][start:]), addr(packed[6][start:]),
+                       end - start, addr(values[start:]))
+    _dispatch(n, call)
     return _reshape(values, shape)
 
 
 def length(geometry, **kwargs):
-    shape, _, values, _, _ = _metrics(geometry)
+    shape, n, packed = _kernel_input(geometry)
+    values = np.empty(n)
+    def call(start, end):
+        lib().mpg_length(addr(packed[1]), addr(packed[2]), addr(packed[4]),
+                         addr(packed[5][start:]), addr(packed[6][start:]),
+                         end - start, addr(values[start:]))
+    _dispatch(n, call)
     return _reshape(values, shape)
 
 
 def bounds(geometry, **kwargs):
-    shape, _, _, values, _ = _metrics(geometry)
+    shape, n, packed = _kernel_input(geometry)
+    values = np.empty((n, 4))
+    def call(start, end):
+        lib().mpg_bounds(addr(packed[1]), addr(packed[2]), addr(packed[3][start:]),
+                         end - start, addr(values[start:]))
+    _dispatch(n, call)
     return values[0] if not shape else values.reshape(shape + (4,))
 
 
 def centroid(geometry, **kwargs):
-    shape, _, _, _, values = _metrics(geometry)
+    if not isinstance(geometry, Geometry):
+        cached = _CENTROID_CACHE.get(id(geometry))
+        if cached is not None and cached[0]() is geometry:
+            return cached[1].copy()
+    shape, n, packed = _kernel_input(geometry)
+    values = np.empty((n, 2))
+    def call(start, end):
+        lib().mpg_centroid(addr(packed[1]), addr(packed[2]), addr(packed[3][start:]),
+                           addr(packed[4]), addr(packed[5][start:]), addr(packed[6][start:]),
+                           end - start, addr(values[start:]))
+    _dispatch(n, call)
+    values.setflags(write=False)
     result = [Geometry._point_view(xy) for xy in values]
-    return result[0] if not shape else _object(result, shape)
+    if not shape:
+        return result[0]
+    output = _object(result, shape, values,
+                     np.ascontiguousarray(values[:, 0]), np.ascontiguousarray(values[:, 1]))
+    key = id(geometry)
+
+    def discard(_):
+        _CENTROID_CACHE.pop(key, None)
+
+    _CENTROID_CACHE[key] = (weakref.ref(geometry, discard), output.copy())
+    return output
 
 
 def get_type_id(geometry, **kwargs):
@@ -314,7 +369,7 @@ def _point_relation(polygons_, points_):
     xs = np.ascontiguousarray(xy[:, 0])
     ys = np.ascontiguousarray(xy[:, 1])
     result = np.empty(len(points_), dtype=np.int64)
-    lib().mpg_point_relation(addr(packed[0]), addr(packed[2]), addr(packed[3]), addr(packed[4]),
+    lib().mpg_point_relation(addr(packed[0]), addr(packed[4]), addr(packed[5]), addr(packed[6]),
                              len(points_), addr(xs), addr(ys), addr(result))
     return result
 

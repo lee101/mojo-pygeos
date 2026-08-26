@@ -73,17 +73,22 @@ runs and include public-API packing/broadcasting costs.
 
 | kernel | mojo-pygeos | pygeos 0.14 | ratio |
 | --- | ---: | ---: | --- |
-| area, 100k quadrilaterals | 10.0 ms | 5.1 ms | 0.51x slower |
-| length, 100k quadrilaterals | 10.0 ms | 5.2 ms | 0.52x slower |
-| bounds, 100k quadrilaterals | 9.9 ms | 34.3 ms | 3.45x faster |
-| centroid, 100k quadrilaterals | 377.4 ms | 74.2 ms | 0.20x slower |
-| point distance, 100k pairs | 0.3 ms | 36.1 ms | 130.58x faster |
+| area, 100k quadrilaterals | 0.9 ms | 4.2 ms | 4.42x faster |
+| length, 100k quadrilaterals | 0.9 ms | 4.4 ms | 4.81x faster |
+| bounds, 100k quadrilaterals | 1.0 ms | 33.1 ms | 32.82x faster |
+| centroid, 100k quadrilaterals | 1.1 ms | 84.0 ms | 74.21x faster |
+| point distance, 100k pairs | 0.3 ms | 36.7 ms | 128.63x faster |
 
-Packed coordinate buffers are retained for repeated vectorised operations, so
-the NumPy-to-Mojo boundary remains zero-copy after the initial pack. Point
-distance uses a SIMD CPU kernel with a scalar tail. GPU execution is omitted:
-these geometry passes are memory-bound and below the arithmetic intensity at
-which transfer and launch overhead can beat the CPU.
+Packed coordinate buffers and contiguous x/y views are retained for repeated
+vectorised operations, so each NumPy-to-Mojo call is zero-copy after the
+initial pack. Dedicated area, length, and centroid kernels reduce edges with
+native-width SIMD and scalar tails. Batches of at least 8,192 geometries are
+split into independent Mojo calls on a persistent eight-thread CPU pool;
+smaller batches stay serial. Immutable centroid point objects are retained and
+returned in independent shallow array copies, avoiding repeated Python object
+allocation. GPU execution is omitted: these geometry passes are memory-bound
+and below the arithmetic intensity at which transfer and launch overhead can
+beat the CPU.
 
 ## License
 
